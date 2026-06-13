@@ -118,6 +118,49 @@ test.describe('IncrementSeq', () => {
     t.assert.strictEqual(contextR.seq, 1)
   })
 
+  it('concurrentOpen decrypts in-order ciphertexts opened concurrently', async (t: test.TestContext) => {
+    const kp = await suite.DeriveKeyPair(new Uint8Array(suite.KEM.Nsk))
+    const pkR = kp.publicKey
+
+    const { encapsulatedSecret: enc, ctx: contextS } = await suite.SetupSender(pkR)
+    const contextR = await suite.SetupRecipient(kp, enc, { concurrentOpen: true })
+
+    const aad = new Uint8Array([1, 2, 3])
+    const numMessages = 10
+
+    const plaintexts = Array.from({ length: numMessages }, (_, i) => new Uint8Array([i, i, i, i]))
+    const ciphertexts = await Promise.all(plaintexts.map((pt) => contextS.Seal(pt, aad)))
+
+    // Open all ciphertexts concurrently (call order = generation order)
+    const decrypted = await Promise.all(ciphertexts.map((ct) => contextR.Open(ct, aad)))
+
+    for (let i = 0; i < numMessages; i++) {
+      t.assert.deepStrictEqual(decrypted[i], plaintexts[i])
+    }
+    t.assert.strictEqual(contextR.seq, numMessages)
+  })
+
+  it('concurrentOpen poisons the context after a failed Open', async (t: test.TestContext) => {
+    const kp = await suite.DeriveKeyPair(new Uint8Array(suite.KEM.Nsk))
+    const pkR = kp.publicKey
+
+    const { encapsulatedSecret: enc, ctx: contextS } = await suite.SetupSender(pkR)
+    const contextR = await suite.SetupRecipient(kp, enc, { concurrentOpen: true })
+
+    const aad = new Uint8Array([1, 2, 3])
+    const ct0 = await contextS.Seal(new Uint8Array([4, 5, 6]), aad)
+    const ct1 = await contextS.Seal(new Uint8Array([7, 8, 9]), aad)
+
+    // Tamper with the first ciphertext so its Open fails
+    const badCt = new Uint8Array(ct0)
+    badCt[0]! ^= 0xff
+
+    await t.assert.rejects(contextR.Open(badCt, aad), HPKE.OpenError)
+
+    // After a failed Open the context is poisoned: even a valid ciphertext is rejected
+    await t.assert.rejects(contextR.Open(ct1, aad), HPKE.OpenError)
+  })
+
   it('Export() does not increment sequence number', async (t: test.TestContext) => {
     const kp = await suite.DeriveKeyPair(
       new Uint8Array(suite.KEM.Nsk),

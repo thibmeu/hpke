@@ -304,6 +304,8 @@ class RecipientContext {
   #seq: number = 0
   #max_seq: number
   #mutex?: Mutex
+  #concurrent: boolean
+  #poisoned: boolean = false
 
   constructor(
     suite: Triple,
@@ -311,6 +313,7 @@ class RecipientContext {
     key: Uint8Array,
     base_nonce: Uint8Array,
     exporter_secret: Uint8Array,
+    concurrent: boolean = false,
   ) {
     this.#suite = suite
     this.#mode = mode
@@ -318,6 +321,7 @@ class RecipientContext {
     this.#base_nonce = base_nonce
     this.#exporter_secret = exporter_secret
     this.#max_seq = MaxSeq(suite.AEAD.Nn)
+    this.#concurrent = concurrent
   }
 
   /**
@@ -331,9 +335,10 @@ class RecipientContext {
 
   /**
    * @returns The sequence number for this context's next {@link Open}, initially zero, increments
-   *   automatically with each successful {@link Open}. The sequence number provides AEAD nonce
-   *   uniqueness. The maximum supported sequence number is the lower of the AEAD nonce-size limit
-   *   and `2^53-1`.
+   *   automatically with each successful {@link Open} (or with each {@link Open}, including a failed
+   *   one, when the context was created with `concurrentOpen`). The sequence number provides AEAD
+   *   nonce uniqueness. The maximum supported sequence number is the lower of the AEAD nonce-size
+   *   limit and `2^53-1`.
    */
   get seq(): number {
     return this.#seq
@@ -344,6 +349,11 @@ class RecipientContext {
    *
    * Applications must ensure that ciphertexts are presented to `Open` in the exact order they were
    * produced by the sender.
+   *
+   * By default, overlapping `Open` calls are serialized. If the context was created with the
+   * `concurrentOpen` option, overlapping `Open` calls instead run their AEAD in parallel; in that
+   * mode the first failed `Open` permanently invalidates the context and all later `Open` calls are
+   * rejected with {@link OpenError}.
    *
    * @example
    *
@@ -373,6 +383,35 @@ class RecipientContext {
 
     if (this.#suite.AEAD.id === EXPORT_ONLY) {
       throw new TypeError('Export-only AEAD cannot be used with Open')
+    }
+
+    if (this.#concurrent) {
+      // Concurrent mode (opt-in via SetupRecipient `concurrentOpen`): claim the sequence
+      // number synchronously (see SenderContext.Seal) so the AEAD runs lock-free and
+      // overlapping Open calls can use the WebCrypto threadpool in parallel. Unlike the
+      // locked path, a failed decrypt has already advanced seq, so the context is poisoned
+      // and all further Open calls are rejected. This makes the advanced seq unobservable
+      // and matches RFC 9180's model where a failed Open leaves the context unusable.
+      if (this.#poisoned) {
+        throw new OpenError('Context invalidated by a previous failed Open')
+      }
+      const seq = this.#seq
+      this.#seq = IncrementSeq(seq)
+      try {
+        return await this.#suite.AEAD.Open(
+          this.#key,
+          ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
+          aad,
+          ciphertext,
+        )
+      } catch (cause) {
+        this.#poisoned = true
+        if (cause instanceof MessageLimitReachedError || cause instanceof NotSupportedError) {
+          throw cause
+        }
+
+        throw new OpenError('AEAD decryption failed', { cause })
+      }
     }
 
     this.#mutex ??= new Mutex()
@@ -1134,6 +1173,10 @@ export class CipherSuite<K extends Key = Key> {
    * @param options.info - Application-supplied information
    * @param options.psk - Pre-shared key (for PSK mode)
    * @param options.pskId - Pre-shared key identifier (for PSK mode)
+   * @param options.concurrentOpen - Opt in to running overlapping {@link RecipientContext.Open}
+   *   calls in parallel instead of serializing them. Only enable this if your application treats
+   *   any {@link RecipientContext.Open} failure as fatal: the first failed `Open` permanently
+   *   invalidates the context and all subsequent `Open` calls are rejected. Defaults to `false`.
    *
    * @returns A Promise that resolves to the recipient context.
    * @see [SetupBaseR / SetupPSKR](https://datatracker.ietf.org/doc/html/draft-ietf-hpke-hpke-04.html#section-5.1.1)
@@ -1141,7 +1184,12 @@ export class CipherSuite<K extends Key = Key> {
   async SetupRecipient(
     privateKey: K | KeyPair<K>,
     encapsulatedSecret: Uint8Array,
-    options?: { info?: Uint8Array; psk?: Uint8Array; pskId?: Uint8Array },
+    options?: {
+      info?: Uint8Array
+      psk?: Uint8Array
+      pskId?: Uint8Array
+      concurrentOpen?: boolean
+    },
   ): Promise<RecipientContext> {
     const { skR, pkR } = this.#extractRecipientKeys(privateKey)
     checkUint8Array(encapsulatedSecret, 'encapsulatedSecret')
@@ -1169,7 +1217,14 @@ export class CipherSuite<K extends Key = Key> {
       options?.pskId,
     )
 
-    return new RecipientContext(this.#suite, mode, key, base_nonce, exporter_secret)
+    return new RecipientContext(
+      this.#suite,
+      mode,
+      key,
+      base_nonce,
+      exporter_secret,
+      options?.concurrentOpen === true,
+    )
   }
 
   #extractRecipientKeys(skR: K | KeyPair<K>): { skR: K; pkR: K | undefined } {
