@@ -133,6 +133,7 @@ class SenderContext {
   #seq: number = 0
   #max_seq: number
   #mutex?: Mutex
+  #concurrent: boolean
 
   constructor(
     suite: Triple,
@@ -140,6 +141,7 @@ class SenderContext {
     key: Uint8Array,
     base_nonce: Uint8Array,
     exporter_secret: Uint8Array,
+    concurrent: boolean = false,
   ) {
     this.#suite = suite
     this.#mode = mode
@@ -147,6 +149,7 @@ class SenderContext {
     this.#base_nonce = base_nonce
     this.#exporter_secret = exporter_secret
     this.#max_seq = MaxSeq(suite.AEAD.Nn)
+    this.#concurrent = concurrent
   }
 
   /**
@@ -160,9 +163,10 @@ class SenderContext {
 
   /**
    * @returns The sequence number for this context's next {@link Seal}, initially zero, increments
-   *   automatically with each successful {@link Seal}. The sequence number provides AEAD nonce
-   *   uniqueness. The maximum supported sequence number is the lower of the AEAD nonce-size limit
-   *   and `2^53-1`.
+   *   automatically with each successful {@link Seal} (or with each {@link Seal}, including a failed
+   *   one, when the context was created with `concurrentSeal`). The sequence number provides AEAD
+   *   nonce uniqueness. The maximum supported sequence number is the lower of the AEAD nonce-size
+   *   limit and `2^53-1`.
    */
   get seq(): number {
     return this.#seq
@@ -200,6 +204,22 @@ class SenderContext {
     checkUint8Array(aad, 'aad')
     if (this.#suite.AEAD.id === EXPORT_ONLY) {
       throw new TypeError('Export-only AEAD cannot be used with Seal')
+    }
+
+    if (this.#concurrent) {
+      // Claim the sequence number synchronously: the read and increment below run
+      // without an intervening await, so JS run-to-completion guarantees each
+      // in-flight Seal gets a distinct, monotonic seq (and thus a distinct nonce)
+      // even when many calls overlap. This lets the AEAD run lock-free so concurrent
+      // Seals dispatch to the WebCrypto threadpool in parallel instead of serializing.
+      const seq = this.#seq
+      this.#seq = IncrementSeq(seq)
+      return await this.#suite.AEAD.Seal(
+        this.#key,
+        ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
+        aad,
+        plaintext,
+      )
     }
 
     this.#mutex ??= new Mutex()
@@ -1022,6 +1042,9 @@ export class CipherSuite<K extends Key = Key> {
    * @param options.info - Application-supplied information
    * @param options.psk - Pre-shared key (for PSK modes)
    * @param options.pskId - Pre-shared key identifier (for PSK modes)
+   * @param options.concurrentSeal - Opt in to running overlapping {@link SenderContext.Seal} calls
+   *   in parallel instead of serializing them. Only enable this if your application treats a failed
+   *   {@link SenderContext.Seal} as consuming a sequence number. Defaults to `false`.
    *
    * @returns A Promise that resolves to an object containing the encapsulated secret and the sender
    *   context (`ctx`). The encapsulated secret is {@link CipherSuite.KEM Nenc} bytes.
@@ -1029,7 +1052,7 @@ export class CipherSuite<K extends Key = Key> {
    */
   async SetupSender(
     publicKey: K,
-    options?: { info?: Uint8Array; psk?: Uint8Array; pskId?: Uint8Array },
+    options?: { info?: Uint8Array; psk?: Uint8Array; pskId?: Uint8Array; concurrentSeal?: boolean },
   ): Promise<{ encapsulatedSecret: Uint8Array; ctx: SenderContext }> {
     isKey(publicKey, 'public')
 
@@ -1056,7 +1079,14 @@ export class CipherSuite<K extends Key = Key> {
       options?.pskId,
     )
 
-    const ctx = new SenderContext(this.#suite, mode, key, base_nonce, exporter_secret)
+    const ctx = new SenderContext(
+      this.#suite,
+      mode,
+      key,
+      base_nonce,
+      exporter_secret,
+      options?.concurrentSeal === true,
+    )
     return { encapsulatedSecret: enc, ctx }
   }
 

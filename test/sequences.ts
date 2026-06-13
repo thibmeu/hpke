@@ -36,15 +36,17 @@ test.describe('IncrementSeq', () => {
     t.assert.strictEqual(contextR.seq, 1)
   })
 
-  it('Concurrent Seal() calls must not reuse sequence numbers (race condition test)', async (t: test.TestContext) => {
-    // This test verifies that concurrent calls to Seal() don't cause a race condition
+  it('concurrentSeal does not reuse sequence numbers', async (t: test.TestContext) => {
+    // This test verifies that concurrentSeal doesn't cause a race condition
     // where multiple calls read the same sequence number before any of them increment it.
     // If there's a race condition, multiple messages would use the same nonce.
 
     const kp = await suite.DeriveKeyPair(new Uint8Array(suite.KEM.Nsk))
     const pkR = kp.publicKey
 
-    const { encapsulatedSecret: enc, ctx: contextS } = await suite.SetupSender(pkR)
+    const { encapsulatedSecret: enc, ctx: contextS } = await suite.SetupSender(pkR, {
+      concurrentSeal: true,
+    })
     const contextR = await suite.SetupRecipient(kp, enc)
 
     const aad = new Uint8Array([1, 2, 3])
