@@ -128,7 +128,6 @@ class SenderContext {
   #exporter_secret: Uint8Array
   #mode: typeof MODE_BASE | typeof MODE_PSK
   #seq: number = 0
-  #mutex?: Mutex
 
   constructor(
     suite: Triple,
@@ -196,21 +195,19 @@ class SenderContext {
       throw new TypeError('Export-only AEAD cannot be used with Seal')
     }
 
-    this.#mutex ??= new Mutex()
-    const release = await this.#mutex.lock()
-    let ct: Uint8Array
-    try {
-      ct = await this.#suite.AEAD.Seal(
-        this.#key,
-        ComputeNonce(this.#base_nonce, this.#seq, this.#suite.AEAD.Nn),
-        aad,
-        plaintext,
-      )
-      this.#seq = IncrementSeq(this.#seq)
-      return ct
-    } finally {
-      release()
-    }
+    // Claim the sequence number synchronously: the read and increment below run
+    // without an intervening await, so JS run-to-completion guarantees each
+    // in-flight Seal gets a distinct, monotonic seq (and thus a distinct nonce)
+    // even when many calls overlap. This lets the AEAD run lock-free so concurrent
+    // Seals dispatch to the WebCrypto threadpool in parallel instead of serializing.
+    const seq = this.#seq
+    this.#seq = IncrementSeq(seq)
+    return await this.#suite.AEAD.Seal(
+      this.#key,
+      ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
+      aad,
+      plaintext,
+    )
   }
 
   /**
