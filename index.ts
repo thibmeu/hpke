@@ -105,6 +105,15 @@ class Mutex {
   }
 }
 
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown }
+
+function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
+  return promise.then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  )
+}
+
 /**
  * Context for encrypting multiple messages and exporting secrets on the sender side.
  *
@@ -134,6 +143,8 @@ class SenderContext {
   #max_seq: number
   #mutex?: Mutex
   #concurrent: boolean
+  #failure?: Error
+  #settlement: Promise<void> = Promise.resolve()
 
   constructor(
     suite: Triple,
@@ -163,10 +174,10 @@ class SenderContext {
 
   /**
    * @returns The sequence number for this context's next {@link Seal}, initially zero, increments
-   *   automatically with each successful {@link Seal} (or with each {@link Seal}, including a failed
-   *   one, when the context was created with `concurrentSeal`). The sequence number provides AEAD
-   *   nonce uniqueness. The maximum supported sequence number is the lower of the AEAD nonce-size
-   *   limit and `2^53-1`.
+   *   automatically with each successful {@link Seal}. With `concurrentSeal`, sequence numbers are
+   *   reserved when calls begin, and any failure permanently invalidates the context. The sequence
+   *   number provides AEAD nonce uniqueness. The maximum supported sequence number is the lower of
+   *   the AEAD nonce-size limit and `2^53-1`.
    */
   get seq(): number {
     return this.#seq
@@ -207,19 +218,46 @@ class SenderContext {
     }
 
     if (this.#concurrent) {
-      // Claim the sequence number synchronously: the read and increment below run
-      // without an intervening await, so JS run-to-completion guarantees each
-      // in-flight Seal gets a distinct, monotonic seq (and thus a distinct nonce)
-      // even when many calls overlap. This lets the AEAD run lock-free so concurrent
-      // Seals dispatch to the WebCrypto threadpool in parallel instead of serializing.
-      const seq = this.#seq
-      this.#seq = IncrementSeq(seq)
-      return await this.#suite.AEAD.Seal(
-        this.#key,
-        ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
-        aad,
-        plaintext,
+      if (this.#failure) {
+        throw this.#failure
+      }
+
+      let operation: Promise<Settled<Uint8Array>>
+      try {
+        const seq = this.#seq
+        this.#seq = IncrementSeq(seq, this.#max_seq)
+        operation = settle(
+          this.#suite.AEAD.Seal(
+            this.#key,
+            ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
+            aad,
+            plaintext,
+          ),
+        )
+      } catch (cause) {
+        operation = Promise.resolve({ ok: false, error: cause })
+      }
+
+      const published = this.#settlement.then(async () => {
+        if (this.#failure) {
+          throw this.#failure
+        }
+        const result = await operation
+        if (!result.ok) {
+          const failure =
+            result.error instanceof Error
+              ? result.error
+              : new Error('AEAD encryption failed', { cause: result.error })
+          this.#failure = new Error('Context invalidated by a failed Seal', { cause: failure })
+          throw failure
+        }
+        return result.value
+      })
+      this.#settlement = published.then(
+        () => undefined,
+        () => undefined,
       )
+      return await published
     }
 
     this.#mutex ??= new Mutex()
@@ -305,7 +343,8 @@ class RecipientContext {
   #max_seq: number
   #mutex?: Mutex
   #concurrent: boolean
-  #poisoned: boolean = false
+  #failure?: Error
+  #settlement: Promise<void> = Promise.resolve()
 
   constructor(
     suite: Triple,
@@ -335,10 +374,10 @@ class RecipientContext {
 
   /**
    * @returns The sequence number for this context's next {@link Open}, initially zero, increments
-   *   automatically with each successful {@link Open} (or with each {@link Open}, including a failed
-   *   one, when the context was created with `concurrentOpen`). The sequence number provides AEAD
-   *   nonce uniqueness. The maximum supported sequence number is the lower of the AEAD nonce-size
-   *   limit and `2^53-1`.
+   *   automatically with each successful {@link Open}. With `concurrentOpen`, sequence numbers are
+   *   reserved when calls begin, and any failure permanently invalidates the context. The sequence
+   *   number provides AEAD nonce uniqueness. The maximum supported sequence number is the lower of
+   *   the AEAD nonce-size limit and `2^53-1`.
    */
   get seq(): number {
     return this.#seq
@@ -352,8 +391,8 @@ class RecipientContext {
    *
    * By default, overlapping `Open` calls are serialized. If the context was created with the
    * `concurrentOpen` option, overlapping `Open` calls instead run their AEAD in parallel; in that
-   * mode the first failed `Open` permanently invalidates the context and all later `Open` calls are
-   * rejected with {@link OpenError}.
+   * mode promises settle in invocation order, and the first failed `Open` permanently invalidates
+   * the context. All pending and later `Open` calls are rejected with {@link OpenError}.
    *
    * @example
    *
@@ -386,32 +425,47 @@ class RecipientContext {
     }
 
     if (this.#concurrent) {
-      // Concurrent mode (opt-in via SetupRecipient `concurrentOpen`): claim the sequence
-      // number synchronously (see SenderContext.Seal) so the AEAD runs lock-free and
-      // overlapping Open calls can use the WebCrypto threadpool in parallel. Unlike the
-      // locked path, a failed decrypt has already advanced seq, so the context is poisoned
-      // and all further Open calls are rejected. This makes the advanced seq unobservable
-      // and matches RFC 9180's model where a failed Open leaves the context unusable.
-      if (this.#poisoned) {
-        throw new OpenError('Context invalidated by a previous failed Open')
+      if (this.#failure) {
+        throw this.#failure
       }
-      const seq = this.#seq
-      this.#seq = IncrementSeq(seq)
+
+      let operation: Promise<Settled<Uint8Array>>
       try {
-        return await this.#suite.AEAD.Open(
-          this.#key,
-          ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
-          aad,
-          ciphertext,
+        const seq = this.#seq
+        this.#seq = IncrementSeq(seq, this.#max_seq)
+        operation = settle(
+          this.#suite.AEAD.Open(
+            this.#key,
+            ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
+            aad,
+            ciphertext,
+          ),
         )
       } catch (cause) {
-        this.#poisoned = true
-        if (cause instanceof MessageLimitReachedError || cause instanceof NotSupportedError) {
-          throw cause
-        }
-
-        throw new OpenError('AEAD decryption failed', { cause })
+        operation = Promise.resolve({ ok: false, error: cause })
       }
+
+      const published = this.#settlement.then(async () => {
+        if (this.#failure) {
+          throw this.#failure
+        }
+        const result = await operation
+        if (!result.ok) {
+          const failure =
+            result.error instanceof MessageLimitReachedError ||
+            result.error instanceof NotSupportedError
+              ? result.error
+              : new OpenError('AEAD decryption failed', { cause: result.error })
+          this.#failure = new OpenError('Context invalidated by a failed Open', { cause: failure })
+          throw failure
+        }
+        return result.value
+      })
+      this.#settlement = published.then(
+        () => undefined,
+        () => undefined,
+      )
+      return await published
     }
 
     this.#mutex ??= new Mutex()
@@ -1082,8 +1136,8 @@ export class CipherSuite<K extends Key = Key> {
    * @param options.psk - Pre-shared key (for PSK modes)
    * @param options.pskId - Pre-shared key identifier (for PSK modes)
    * @param options.concurrentSeal - Opt in to running overlapping {@link SenderContext.Seal} calls
-   *   in parallel instead of serializing them. Only enable this if your application treats a failed
-   *   {@link SenderContext.Seal} as consuming a sequence number. Defaults to `false`.
+   *   in parallel while settling their promises in invocation order. Any failed `Seal` permanently
+   *   invalidates the context and rejects all pending and later calls. Defaults to `false`.
    *
    * @returns A Promise that resolves to an object containing the encapsulated secret and the sender
    *   context (`ctx`). The encapsulated secret is {@link CipherSuite.KEM Nenc} bytes.
@@ -1174,9 +1228,9 @@ export class CipherSuite<K extends Key = Key> {
    * @param options.psk - Pre-shared key (for PSK mode)
    * @param options.pskId - Pre-shared key identifier (for PSK mode)
    * @param options.concurrentOpen - Opt in to running overlapping {@link RecipientContext.Open}
-   *   calls in parallel instead of serializing them. Only enable this if your application treats
-   *   any {@link RecipientContext.Open} failure as fatal: the first failed `Open` permanently
-   *   invalidates the context and all subsequent `Open` calls are rejected. Defaults to `false`.
+   *   calls in parallel while settling their promises in invocation order. Any failed `Open`
+   *   permanently invalidates the context and rejects all pending and later calls. Defaults to
+   *   `false`.
    *
    * @returns A Promise that resolves to the recipient context.
    * @see [SetupBaseR / SetupPSKR](https://datatracker.ietf.org/doc/html/draft-ietf-hpke-hpke-04.html#section-5.1.1)
@@ -1184,12 +1238,7 @@ export class CipherSuite<K extends Key = Key> {
   async SetupRecipient(
     privateKey: K | KeyPair<K>,
     encapsulatedSecret: Uint8Array,
-    options?: {
-      info?: Uint8Array
-      psk?: Uint8Array
-      pskId?: Uint8Array
-      concurrentOpen?: boolean
-    },
+    options?: { info?: Uint8Array; psk?: Uint8Array; pskId?: Uint8Array; concurrentOpen?: boolean },
   ): Promise<RecipientContext> {
     const { skR, pkR } = this.#extractRecipientKeys(privateKey)
     checkUint8Array(encapsulatedSecret, 'encapsulatedSecret')
