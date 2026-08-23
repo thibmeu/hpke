@@ -42,6 +42,7 @@
   "scripts": {
     "build": "node build.cjs",
     "build:other": "npx tsc -p tsconfig.test.json && npx tsc -p tsconfig.examples.json",
+    "bench:concurrent": "node bench/concurrent.mjs",
     "docs": "npx typedoc",
     "format": "prettier --log-level silent --cache --write '**/*.{ts,js,mjs,cjs,json,yml}' '**/README.md'",
     "test": "node --test --no-warnings test/*.ts",

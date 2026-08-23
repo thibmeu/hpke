@@ -102,6 +102,79 @@ class Mutex {
   }
 }
 
+type OperationMode = 'concurrent-fail-stop'
+
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown }
+
+class ContextSequence {
+  #seq = 0
+  #mutex?: Mutex
+  #settlement: Promise<void> = Promise.resolve()
+  #failure?: Error
+  #concurrent: boolean
+  #normalize: (cause: unknown) => Error
+
+  constructor(mode: OperationMode | undefined, normalize: (cause: unknown) => Error) {
+    if (mode !== undefined && mode !== 'concurrent-fail-stop') {
+      throw new TypeError('Invalid "operationMode"')
+    }
+    this.#concurrent = mode !== undefined
+    this.#normalize = normalize
+  }
+
+  get seq(): number {
+    return this.#seq
+  }
+
+  async run<T>(operation: (seq: number) => Promise<T>) {
+    if (!this.#concurrent) {
+      this.#mutex ??= new Mutex()
+      const release = await this.#mutex.lock()
+      try {
+        let value: T
+        try {
+          value = await operation(this.#seq)
+        } catch (cause) {
+          throw this.#normalize(cause)
+        }
+        this.#seq = IncrementSeq(this.#seq)
+        return value
+      } finally {
+        release()
+      }
+    }
+
+    if (this.#failure) {
+      throw this.#failure
+    }
+
+    const seq = this.#seq
+    this.#seq = IncrementSeq(seq)
+    const operationResult: Promise<Settled<T>> = Promise.resolve()
+      .then(() => operation(seq))
+      .then(
+        (value) => ({ ok: true, value }),
+        (error) => ({ ok: false, error }),
+      )
+    const published = this.#settlement.then(async () => {
+      if (this.#failure) {
+        throw this.#failure
+      }
+      const result = await operationResult
+      if (!result.ok) {
+        this.#failure = this.#normalize(result.error)
+        throw this.#failure
+      }
+      return result.value
+    })
+    this.#settlement = published.then(
+      () => undefined,
+      () => undefined,
+    )
+    return await published
+  }
+}
+
 /**
  * Context for encrypting multiple messages and exporting secrets on the sender side.
  *
@@ -127,8 +200,7 @@ class SenderContext {
   #base_nonce: Uint8Array
   #exporter_secret: Uint8Array
   #mode: typeof MODE_BASE | typeof MODE_PSK
-  #seq: number = 0
-  #mutex?: Mutex
+  #sequence: ContextSequence
 
   constructor(
     suite: Triple,
@@ -136,12 +208,16 @@ class SenderContext {
     key: Uint8Array,
     base_nonce: Uint8Array,
     exporter_secret: Uint8Array,
+    operationMode?: OperationMode,
   ) {
     this.#suite = suite
     this.#mode = mode
     this.#key = key
     this.#base_nonce = base_nonce
     this.#exporter_secret = exporter_secret
+    this.#sequence = new ContextSequence(operationMode, (cause) =>
+      cause instanceof Error ? cause : new Error('AEAD encryption failed', { cause }),
+    )
   }
 
   /**
@@ -159,7 +235,7 @@ class SenderContext {
    *   uniqueness. The maximum supported sequence number in this implementation is `2^53-1`.
    */
   get seq(): number {
-    return this.#seq
+    return this.#sequence.seq
   }
 
   /**
@@ -196,21 +272,14 @@ class SenderContext {
       throw new TypeError('Export-only AEAD cannot be used with Seal')
     }
 
-    this.#mutex ??= new Mutex()
-    const release = await this.#mutex.lock()
-    let ct: Uint8Array
-    try {
-      ct = await this.#suite.AEAD.Seal(
+    return await this.#sequence.run((seq) =>
+      this.#suite.AEAD.Seal(
         this.#key,
-        ComputeNonce(this.#base_nonce, this.#seq, this.#suite.AEAD.Nn),
+        ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
         aad,
         plaintext,
-      )
-      this.#seq = IncrementSeq(this.#seq)
-      return ct
-    } finally {
-      release()
-    }
+      ),
+    )
   }
 
   /**
@@ -275,8 +344,7 @@ class RecipientContext {
   #base_nonce: Uint8Array
   #exporter_secret: Uint8Array
   #mode: typeof MODE_BASE | typeof MODE_PSK
-  #seq: number = 0
-  #mutex?: Mutex
+  #sequence: ContextSequence
 
   constructor(
     suite: Triple,
@@ -284,12 +352,19 @@ class RecipientContext {
     key: Uint8Array,
     base_nonce: Uint8Array,
     exporter_secret: Uint8Array,
+    operationMode?: OperationMode,
   ) {
     this.#suite = suite
     this.#mode = mode
     this.#key = key
     this.#base_nonce = base_nonce
     this.#exporter_secret = exporter_secret
+    this.#sequence = new ContextSequence(operationMode, (cause) => {
+      if (cause instanceof MessageLimitReachedError || cause instanceof NotSupportedError) {
+        return cause
+      }
+      return new OpenError('AEAD decryption failed', { cause })
+    })
   }
 
   /**
@@ -303,11 +378,12 @@ class RecipientContext {
 
   /**
    * @returns The sequence number for this context's next {@link Open}, initially zero, increments
-   *   automatically with each successful {@link Open}. The sequence number provides AEAD nonce
-   *   uniqueness. The maximum supported sequence number in this implementation is `2^53-1`.
+   *   automatically with each successful {@link Open}. In `concurrent-fail-stop` mode, sequence
+   *   numbers are reserved when calls begin. The sequence number provides AEAD nonce uniqueness.
+   *   The maximum supported sequence number in this implementation is `2^53-1`.
    */
   get seq(): number {
-    return this.#seq
+    return this.#sequence.seq
   }
 
   /**
@@ -315,6 +391,10 @@ class RecipientContext {
    *
    * Applications must ensure that ciphertexts are presented to `Open` in the exact order they were
    * produced by the sender.
+   *
+   * By default, overlapping `Open` calls are serialized. In `concurrent-fail-stop` mode, AEAD work
+   * runs in parallel while promises settle in invocation order. The first failed operation
+   * permanently invalidates the context and rejects pending and later operations.
    *
    * @example
    *
@@ -346,29 +426,14 @@ class RecipientContext {
       throw new TypeError('Export-only AEAD cannot be used with Open')
     }
 
-    this.#mutex ??= new Mutex()
-    const release = await this.#mutex.lock()
-    try {
-      let pt: Uint8Array
-      try {
-        pt = await this.#suite.AEAD.Open(
-          this.#key,
-          ComputeNonce(this.#base_nonce, this.#seq, this.#suite.AEAD.Nn),
-          aad,
-          ciphertext,
-        )
-      } catch (cause) {
-        if (cause instanceof MessageLimitReachedError || cause instanceof NotSupportedError) {
-          throw cause
-        }
-
-        throw new OpenError('AEAD decryption failed', { cause })
-      }
-      this.#seq = IncrementSeq(this.#seq)
-      return pt
-    } finally {
-      release()
-    }
+    return await this.#sequence.run((seq) =>
+      this.#suite.AEAD.Open(
+        this.#key,
+        ComputeNonce(this.#base_nonce, seq, this.#suite.AEAD.Nn),
+        aad,
+        ciphertext,
+      ),
+    )
   }
 
   /**
@@ -910,6 +975,8 @@ export class CipherSuite {
    * @param options.info - Application-supplied information
    * @param options.psk - Pre-shared key (for PSK modes)
    * @param options.pskId - Pre-shared key identifier (for PSK modes)
+   * @param options.operationMode - Set to `concurrent-fail-stop` to run AEAD work concurrently.
+   *   Promises still settle in call order. An AEAD failure permanently invalidates the context.
    *
    * @returns A Promise that resolves to an object containing the encapsulated secret and the
    *   exported secret.
@@ -1019,7 +1086,12 @@ export class CipherSuite {
    */
   async SetupSender(
     publicKey: Key,
-    options?: { info?: Uint8Array; psk?: Uint8Array; pskId?: Uint8Array },
+    options?: {
+      info?: Uint8Array
+      psk?: Uint8Array
+      pskId?: Uint8Array
+      operationMode?: OperationMode
+    },
   ): Promise<{ encapsulatedSecret: Uint8Array; ctx: SenderContext }> {
     isKey(publicKey, 'public')
 
@@ -1046,7 +1118,14 @@ export class CipherSuite {
       options?.pskId,
     )
 
-    const ctx = new SenderContext(this.#suite, mode, key, base_nonce, exporter_secret)
+    const ctx = new SenderContext(
+      this.#suite,
+      mode,
+      key,
+      base_nonce,
+      exporter_secret,
+      options?.operationMode,
+    )
     return { encapsulatedSecret: enc, ctx }
   }
 
@@ -1094,6 +1173,8 @@ export class CipherSuite {
    * @param options.info - Application-supplied information
    * @param options.psk - Pre-shared key (for PSK mode)
    * @param options.pskId - Pre-shared key identifier (for PSK mode)
+   * @param options.operationMode - Set to `concurrent-fail-stop` to run AEAD work concurrently.
+   *   Promises still settle in call order. An AEAD failure permanently invalidates the context.
    *
    * @returns A Promise that resolves to the recipient context.
    * @see [SetupBaseR / SetupPSKR](https://datatracker.ietf.org/doc/html/draft-ietf-hpke-hpke-03.html#section-5.1.1)
@@ -1101,7 +1182,12 @@ export class CipherSuite {
   async SetupRecipient(
     privateKey: Key | KeyPair,
     encapsulatedSecret: Uint8Array,
-    options?: { info?: Uint8Array; psk?: Uint8Array; pskId?: Uint8Array },
+    options?: {
+      info?: Uint8Array
+      psk?: Uint8Array
+      pskId?: Uint8Array
+      operationMode?: OperationMode
+    },
   ): Promise<RecipientContext> {
     const { skR, pkR } = this.#extractRecipientKeys(privateKey)
     checkUint8Array(encapsulatedSecret, 'encapsulatedSecret')
@@ -1129,7 +1215,14 @@ export class CipherSuite {
       options?.pskId,
     )
 
-    return new RecipientContext(this.#suite, mode, key, base_nonce, exporter_secret)
+    return new RecipientContext(
+      this.#suite,
+      mode,
+      key,
+      base_nonce,
+      exporter_secret,
+      options?.operationMode,
+    )
   }
 
   #extractRecipientKeys(skR: Key | KeyPair): { skR: Key; pkR: Key | undefined } {

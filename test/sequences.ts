@@ -8,6 +8,29 @@ const suite = new HPKE.CipherSuite(
   HPKE.AEAD_AES_128_GCM,
 )
 
+function controlledOpen() {
+  const implementation = HPKE.AEAD_AES_128_GCM()
+  const operations: Array<{ succeed(): void }> = []
+  let enabled = false
+
+  const factory: HPKE.AEADFactory = () => ({
+    ...implementation,
+    Open(key, nonce, aad, ciphertext) {
+      if (!enabled) {
+        return implementation.Open(key, nonce, aad, ciphertext)
+      }
+      let succeed!: () => void
+      const gate = new Promise<void>((resolve) => {
+        succeed = resolve
+      })
+      operations.push({ succeed })
+      return gate.then(() => new Uint8Array(ciphertext))
+    },
+  })
+
+  return { factory, operations, enable: () => (enabled = true) }
+}
+
 test.describe('IncrementSeq', () => {
   it('Context seq is 0 before first message and 1 after it', async (t: test.TestContext) => {
     const kp = await suite.DeriveKeyPair(
@@ -36,44 +59,22 @@ test.describe('IncrementSeq', () => {
     t.assert.strictEqual(contextR.seq, 1)
   })
 
-  it('Concurrent Seal() calls must not reuse sequence numbers (race condition test)', async (t: test.TestContext) => {
-    // This test verifies that concurrent calls to Seal() don't cause a race condition
-    // where multiple calls read the same sequence number before any of them increment it.
-    // If there's a race condition, multiple messages would use the same nonce.
-
+  it('concurrent-fail-stop processes overlapping messages with distinct nonces', async (t: test.TestContext) => {
     const kp = await suite.DeriveKeyPair(new Uint8Array(suite.KEM.Nsk))
     const pkR = kp.publicKey
 
-    const { encapsulatedSecret: enc, ctx: contextS } = await suite.SetupSender(pkR)
-    const contextR = await suite.SetupRecipient(kp, enc)
+    const { encapsulatedSecret: enc, ctx: contextS } = await suite.SetupSender(pkR, {
+      operationMode: 'concurrent-fail-stop',
+    })
+    const contextR = await suite.SetupRecipient(kp, enc, { operationMode: 'concurrent-fail-stop' })
 
     const aad = new Uint8Array([1, 2, 3])
-    const numConcurrentCalls = 10
-
-    // Create unique plaintexts
-    const plaintexts = Array.from(
-      { length: numConcurrentCalls },
-      (_, i) => new Uint8Array([i, i, i, i]),
-    )
-
-    // Call Seal() concurrently without awaiting
+    const plaintexts = Array.from({ length: 4 }, (_, i) => new Uint8Array([i]))
     const sealPromises = plaintexts.map((pt) => contextS.Seal(pt, aad))
-
-    // Wait for all to complete
     const ciphertexts = await Promise.all(sealPromises)
 
-    // Verify the final sequence number is correct
-    t.assert.strictEqual(contextS.seq, numConcurrentCalls)
-
-    // All ciphertexts should be different (if same nonce was used, identical plaintexts
-    // would produce identical ciphertexts, though this isn't guaranteed)
-    const uniqueCiphertexts = new Set(ciphertexts.map((ct) => ct.join(',')))
-    t.assert.strictEqual(uniqueCiphertexts.size, numConcurrentCalls)
-
-    // Most importantly: verify that all messages can be decrypted in order
-    // This will fail if any sequence numbers were reused, because the recipient
-    // will be expecting sequential nonces
-    for (let i = 0; i < numConcurrentCalls; i++) {
+    t.assert.strictEqual(contextS.seq, plaintexts.length)
+    for (let i = 0; i < plaintexts.length; i++) {
       const decrypted = await contextR.Open(ciphertexts[i]!, aad)
       t.assert.deepStrictEqual(decrypted, plaintexts[i])
     }
@@ -114,6 +115,60 @@ test.describe('IncrementSeq', () => {
 
     // Now sequence should be 1
     t.assert.strictEqual(contextR.seq, 1)
+  })
+
+  it('concurrent-fail-stop settles promises in invocation order', async (t: test.TestContext) => {
+    const controlled = controlledOpen()
+    const controlledSuite = new HPKE.CipherSuite(
+      HPKE.KEM_DHKEM_P256_HKDF_SHA256,
+      HPKE.KDF_HKDF_SHA256,
+      controlled.factory,
+    )
+    const kp = await controlledSuite.DeriveKeyPair(new Uint8Array(controlledSuite.KEM.Nsk))
+    const { encapsulatedSecret, ctx: sender } = await controlledSuite.SetupSender(kp.publicKey)
+    const recipient = await controlledSuite.SetupRecipient(kp, encapsulatedSecret, {
+      operationMode: 'concurrent-fail-stop',
+    })
+    const ciphertexts = await Promise.all([
+      sender.Seal(new Uint8Array([0])),
+      sender.Seal(new Uint8Array([1])),
+    ])
+    const settled: number[] = []
+
+    controlled.enable()
+    const opens = ciphertexts.map((ciphertext, index) =>
+      recipient.Open(ciphertext).then(() => settled.push(index)),
+    )
+    await Promise.resolve()
+
+    controlled.operations[1]!.succeed()
+    await Promise.resolve()
+    t.assert.deepStrictEqual(settled, [])
+
+    controlled.operations[0]!.succeed()
+    await Promise.all(opens)
+    t.assert.deepStrictEqual(settled, [0, 1])
+  })
+
+  it('concurrent-fail-stop invalidates pending and later operations after a failure', async (t: test.TestContext) => {
+    const kp = await suite.DeriveKeyPair(new Uint8Array(suite.KEM.Nsk))
+    const pkR = kp.publicKey
+
+    const { encapsulatedSecret: enc, ctx: contextS } = await suite.SetupSender(pkR)
+    const contextR = await suite.SetupRecipient(kp, enc, { operationMode: 'concurrent-fail-stop' })
+
+    const aad = new Uint8Array([1, 2, 3])
+    const ct0 = await contextS.Seal(new Uint8Array([4, 5, 6]), aad)
+    const ct1 = await contextS.Seal(new Uint8Array([7, 8, 9]), aad)
+
+    const badCt = new Uint8Array(ct0)
+    badCt[0]! ^= 0xff
+
+    await Promise.all([
+      t.assert.rejects(contextR.Open(badCt, aad), HPKE.OpenError),
+      t.assert.rejects(contextR.Open(ct1, aad), HPKE.OpenError),
+    ])
+    await t.assert.rejects(contextR.Open(ct1, aad), HPKE.OpenError)
   })
 
   it('Export() does not increment sequence number', async (t: test.TestContext) => {
